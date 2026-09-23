@@ -1,0 +1,146 @@
+import os
+from pathlib import Path
+from typing import Any, AsyncGenerator
+
+from openai import AsyncOpenAI
+
+from client.response import EventType, StreamEvent, TextDelta, TokenUsage
+
+
+def _load_env(path: Path | None = None) -> None:
+    env_path = path or Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_env()
+
+
+class LLMClient:
+    def __init__(self) -> None:
+        self._client: AsyncOpenAI | None = None
+        self._api_key = os.getenv("OPENROUTER_API_KEY")
+        self._base_url = os.getenv("OPENROUTER_BASE_URL")
+        self._model = os.getenv("OPENROUTER_MODEL")
+
+        if not self._api_key:
+            raise ValueError("OPENROUTER_API_KEY is not set in .env")
+        if not self._base_url:
+            raise ValueError("OPENROUTER_BASE_URL is not set in .env")
+        if not self._model:
+            raise ValueError("OPENROUTER_MODEL is not set in .env")
+
+    def get_client(self) -> AsyncOpenAI:
+        if self._client is None:
+            self._client = AsyncOpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.close()
+            self._client = None
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        stream: bool = True,
+    ) -> AsyncGenerator[StreamEvent, None]:
+
+        client = self.get_client()
+
+        kwargs = {
+            "model": self._model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if stream:
+            async for event in self._stream_response(client, kwargs):
+                yield event
+        else:
+            event = await self._non_stream_response(client, kwargs)
+            yield event
+        return
+
+
+    async def _stream_response(
+        self,
+        client: AsyncOpenAI,
+        kwargs: dict[str, Any]
+        ) -> AsyncGenerator[StreamEvent, None]:
+
+        response = await client.chat.completions.create(**kwargs)
+        
+        usage: TokenUsage | None = None
+        finish_reason: str | None = None
+
+        async for chunk in response:
+
+            if hasattr (chunk, "usage") and chunk.usage:
+                usage = TokenUsage(
+                    prompt_tokens= chunk.usage.prompt_tokens,
+                    completion_tokens= chunk.usage.completion_tokens,
+                    total_tokens= chunk.usage.total_tokens,
+                    cached_token= chunk.usage.prompt_tokens_details.cached_tokens
+                )
+
+            if not chunk.choices:
+                continue
+        
+            choice = chunk.choices[0]
+            delta  = choice.delta
+
+            if choice.finish_reason:
+                finish_reason  =choice.finish_reason
+            
+            if delta.content:
+                yield StreamEvent(
+                    type= EventType.TEXT_DELTA,
+                    text_delta= TextDelta(delta.content)
+                )
+
+        yield StreamEvent(
+            type= EventType.MESSAGE_COMPLETE,
+            finish_reason=finish_reason,
+            usage= usage,
+        )
+
+        
+
+    async def _non_stream_response(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> StreamEvent:
+        response = await client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        message = choice.message
+
+        text_delta = None
+        if message.content:
+            text_delta = TextDelta(content=message.content)
+
+        usage = None
+        if response.usage:
+            usage = TokenUsage(
+                prompt_tokens= response.usage.prompt_tokens,
+                completion_tokens= response.usage.completion_tokens,
+                total_tokens= response.usage.total_tokens,
+                cached_token= response.usage.prompt_tokens_details.cached_tokens
+            )
+
+    
+        return StreamEvent(
+            type = EventType.MESSAGE_COMPLETE,
+            text_delta= text_delta,
+            finish_reason= choice.finish_reason,
+            usage= usage
+        )
+
+
+
