@@ -1,26 +1,15 @@
+import asyncio
 import os
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
-from openai import AsyncOpenAI
+from dotenv import load_dotenv
+from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 
 from client.response import EventType, StreamEvent, TextDelta, TokenUsage
 
-
-def _load_env(path: Path | None = None) -> None:
-    env_path = path or Path(__file__).resolve().parent.parent / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
-
-
-_load_env()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", interpolate=False)
 
 
 class LLMClient:
@@ -29,6 +18,7 @@ class LLMClient:
         self._api_key = os.getenv("OPENROUTER_API_KEY")
         self._base_url = os.getenv("OPENROUTER_BASE_URL")
         self._model = os.getenv("OPENROUTER_MODEL")
+        self._max_retries: int|None = int(os.getenv("MAX_RETRY"))
 
         if not self._api_key:
             raise ValueError("OPENROUTER_API_KEY is not set in .env")
@@ -56,20 +46,57 @@ class LLMClient:
         stream: bool = True,
     ) -> AsyncGenerator[StreamEvent, None]:
 
+
         client = self.get_client()
 
         kwargs = {
-            "model": self._model,
-            "messages": messages,
-            "stream": stream,
-        }
-        if stream:
-            async for event in self._stream_response(client, kwargs):
-                yield event
-        else:
-            event = await self._non_stream_response(client, kwargs)
-            yield event
-        return
+                    "model": self._model,
+                    "messages": messages,
+                    "stream": stream,
+                }
+        for attemp in range(self._max_retries + 1):
+            try:
+                if stream:
+                    async for event in self._stream_response(client, kwargs):
+                        yield event
+                else:
+                    event = await self._non_stream_response(client, kwargs)
+                    yield event
+                return
+            
+            except RateLimitError as e:
+                if attemp < self._max_retries:
+                    #  But i will add exponential time that will increase 
+                    wait_time = 2**attemp
+                    # 2s
+                    # 4s
+
+                    await asyncio.sleep(wait_time)
+                else:
+                    yield StreamEvent(
+                        type = EventType.ERROR,
+                        error= f"Rate limiting exceeded {e}",
+                    )
+                    return
+
+            except APIConnectionError as e :
+                if attemp < self._max_retries:
+                    wait_time = 2**attemp
+                    await asyncio.sleep(wait_time)
+                else:
+                    yield StreamEvent(
+                        type = EventType.ERROR,
+                        error= f"Connection error happen { e }"
+                    )
+                    return
+
+            except APIError as e:
+                yield  StreamEvent(
+                    type = EventType.ERROR,
+                    error= f"API establishment fail { e }"
+                )
+                return
+
 
 
     async def _stream_response(
@@ -116,7 +143,11 @@ class LLMClient:
 
         
 
-    async def _non_stream_response(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> StreamEvent:
+    async def _non_stream_response(
+        self,
+        client: AsyncOpenAI,
+        kwargs: dict[str, Any],
+    ) -> StreamEvent:
         response = await client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         message = choice.message
