@@ -3,11 +3,13 @@ import sys
 
 import click
 
+from ui.theme import get_console as get_theme_console
 from agent.agent import Agent
 from agent.events import AgentEventType
 from ui.tui import TUI, get_console
 
 console = get_console()
+error_console = get_theme_console(stderr=True)
 
 
 class CLI:
@@ -25,15 +27,37 @@ class CLI:
             return None
 
         response: str | None = None
+
+        assistent_streaming = False
+        final_response: str | None = None
+
         async for event in self.agent.run(message):
             if event.type == AgentEventType.TEXT_DELTA:
                 content = event.data.get("content", "")
-                self.tui.strem_assistent_delta(content)
-            elif event.type == AgentEventType.AGENT_END:
-                response = event.data.get("response")
+                if not assistent_streaming:
+                    self.tui.begain_assistent()
+                    assistent_streaming = True
 
-        self.tui.strem_assistent_delta("\n")
-        return response
+                self.tui.strem_assistent_delta(content)
+
+            elif event.type == AgentEventType.AGENT_ERROR:
+                error = event.data.get("error", "Unknown error")
+                error_console.print(
+                    f"\nError: {error}",
+                    style="status.error",
+                    markup=False,
+                    highlight=False,
+                )
+                click.echo("Please try again.", err=True)
+                return None
+
+            elif event.type == AgentEventType.TEXT_COMPLETE:
+                final_response = event.data.get("response")
+                if assistent_streaming:
+                    self.tui.end_assistent()
+                    assistent_streaming = False
+
+        return final_response
 
 
 @click.command()
@@ -43,6 +67,7 @@ def main(prompt: str | None) -> None:
 
     if prompt:
         result = asyncio.run(cli.run_single(prompt))
+
         if result is None:
             sys.exit(1)
 

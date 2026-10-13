@@ -37,6 +37,7 @@ class Agent:
         ]
 
         response_text = ""
+        
         async for event in self.client.chat_completion(messages, True):
             if event.type == EventType.TEXT_DELTA and event.text_delta:
                 content = event.text_delta.content
